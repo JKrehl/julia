@@ -84,27 +84,3 @@ function retry(f::Function, condition::Function=e->true;
 end
 
 retry(f::Function, t::Type; kw...) = retry(f, e->isa(e, t); kw...)
-
-
-"""
-    @catch(f) -> Function
-
-Returns a lambda that executes `f` and returns either the result of `f` or
-an `Exception` thrown by `f`.
-
-**Examples**
-```julia
-julia> r = @catch(length)([1,2,3])
-3
-
-julia> r = @catch(length)()
-MethodError(length,())
-
-julia> typeof(r)
-MethodError
-```
-"""
-catchf(f) = (args...) -> try f(args...) catch ex; ex end
-macro catch(f)
-    esc(:(Base.catchf($f)))
-end

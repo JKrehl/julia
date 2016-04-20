@@ -9,7 +9,7 @@ if Base.JLOptions().code_coverage == 1
 elseif Base.JLOptions().code_coverage == 2
     cov_flag = `--code-coverage=all`
 end
-addprocs(3; exeflags=`$cov_flag $inline_flag --check-bounds=yes --depwarn=error`)
+addprocs(4; exeflags=`$cov_flag $inline_flag --check-bounds=yes --depwarn=error`)
 
 # Test remote()
 
@@ -670,47 +670,46 @@ let ex
     @test repeated == 1
 end
 
-# The below block of tests are usually run only on local development systems, since:
-# - tests which print errors
-# - addprocs tests are memory intensive
-# - ssh addprocs requires sshd to be running locally with passwordless login enabled.
-# The test block is enabled by defining env JULIA_TESTFULL=1
+# pmap tests. Needs at least 4 processors dedicated to the below tests. Which we currently have
+# since the parallel tests are now spawned as a separate set.
+s = repeat("abcdefghijklmnopqrstuvwxyz", 10);
+ups = uppercase(s);
 
-DoFullTest = Bool(parse(Int,(get(ENV, "JULIA_TESTFULL", "0"))))
-
-if DoFullTest
-    # pmap tests
-    # needs at least 4 processors dedicated to the below tests
-    ppids = remotecall_fetch(()->addprocs(4), 1)
-    pool = WorkerPool(ppids)
-    s = "abcdefghijklmnopqrstuvwxyz";
-    ups = uppercase(s);
-
-    unmangle_exception = e -> begin
+unmangle_exception = e -> begin
+    while (isa(e, CompositeException) || isa(e, RemoteException))
         if isa(e, CompositeException)
             e = e.exceptions[1].ex
-            if isa(e, RemoteException)
-                e = e.captured.ex.exceptions[1].ex
-            end
         end
-        return e
+        if isa(e, RemoteException)
+            e = e.captured.ex
+        end
     end
+    return e
+end
 
+errifeqa = x->(x=='a') ? error("foobar") : uppercase(x)
 
-    for mapf in [map, asyncmap, (f, c) -> pmap(pool, f, c)]
-        @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(x), s)])
-        @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(Char(x)), s.data)])
+errifeven = x->iseven(Int(x)) ? error("foobar") : uppercase(x)
 
+for (throws_err, mapf) in [ (true, map),
+                            (true, asyncmap),
+                            (true, pmap),
+                            (false, (f,c)->pmap(f, c; on_error = e->e)),
+                            (true, (f,c)->pmap(f, c; distributed=false)),
+                            (true, (f,c)->pmap(f, c; batch_size=3))
+                          ]
+    @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(x), s)])
+    @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(Char(x)), s.data)])
+
+    if throws_err
         # retry, on error exit
-        errifeqa = x->(x=='a') ?
-            error("EXPECTED TEST ERROR. TO BE IGNORED.") : uppercase(x)
         try
             res = mapf(retry(errifeqa), s)
             error("unexpected")
         catch e
             e = unmangle_exception(e)
             @test isa(e, ErrorException)
-            @test e.msg == "EXPECTED TEST ERROR. TO BE IGNORED."
+            @test e.msg == "foobar"
         end
 
         # no retry, on error exit
@@ -720,32 +719,41 @@ if DoFullTest
         catch e
             e = unmangle_exception(e)
             @test isa(e, ErrorException)
-            @test e.msg == "EXPECTED TEST ERROR. TO BE IGNORED."
+            @test e.msg == "foobar"
         end
-
-        # no retry, on error continue
-        res = mapf(@catch(errifeqa), Any[s...])
+    else
+        res = mapf(errifeven, s)
         @test length(res) == length(ups)
-        res[1] = unmangle_exception(res[1])
-        @test isa(res[1], ErrorException)
-        @test res[1].msg == "EXPECTED TEST ERROR. TO BE IGNORED."
-        @test ups[2:end] == string(res[2:end]...)
+        for i in 1:length(s)
+            if iseven(Int(s[i]))
+                @test isa(res[i], Exception)
+                e = unmangle_exception(res[i])
+                @test isa(e, ErrorException)
+                @test e.msg == "foobar"
+            else
+                @test res[i] == uppercase(s[i])
+            end
+        end
     end
+end
 
-    # retry, on error exit
-    mapf = (f, c) -> asyncmap(retry(remote(pool, f), n=10, max_delay=0), c)
-    errifevenid = x->iseven(myid()) ?
-        error("EXPECTED TEST ERROR. TO BE IGNORED.") : uppercase(x)
-    res = mapf(errifevenid, s)
-    @test length(res) == length(ups)
-    @test ups == bytestring(UInt8[UInt8(c) for c in res])
+# retry till success.
+errifevenid = x->iseven(myid()) ? error("foobar") : myid()
+mapf = (f, c) -> asyncmap(retry(remote(f), n=typemax(Int), max_delay=0), c)
+res = mapf(errifevenid, s)
+@test length(res) == length(ups)
+@test all(isodd, res)
 
-    # retry, on error continue
-    mapf = (f, c) -> asyncmap(@catch(retry(remote(pool, f), n=10, max_delay=0)), c)
-    res = mapf(errifevenid, s)
-    @test length(res) == length(ups)
-    @test ups == bytestring(UInt8[UInt8(c) for c in res])
 
+# The below block of tests are usually run only on local development systems, since:
+# - tests which print errors
+# - addprocs tests are memory intensive
+# - ssh addprocs requires sshd to be running locally with passwordless login enabled.
+# The test block is enabled by defining env JULIA_TESTFULL=1
+
+DoFullTest = Bool(parse(Int,(get(ENV, "JULIA_TESTFULL", "0"))))
+
+if DoFullTest
     # Topology tests need to run externally since a given cluster at any
     # time can only support a single topology and the current session
     # is already running in parallel under the default topology.

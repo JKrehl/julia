@@ -4,7 +4,8 @@
 """
     AsyncCollector(f, results, c...; ntasks=100) -> iterator
 
-Apply f to each element of c using at most 100 asynchronous tasks.
+Apply f to each element of c using at most max(100, nworkers()) asynchronous
+tasks.
 For multiple collection arguments, apply f elementwise.
 Output is collected into "results".
 
@@ -22,17 +23,17 @@ end
 
 function AsyncCollector(f, results, c...; ntasks=0)
     if ntasks == 0
-        ntasks = 100
+        ntasks = max(nworkers(), 100)
     end
     AsyncCollector(f, results, enumerate(zip(c...)), ntasks)
 end
-
 
 type AsyncCollectorState
     enum_state
     active_count::Int
     task_done::Condition
     done::Bool
+    in_error::Bool
 end
 
 
@@ -49,11 +50,20 @@ wait(state::AsyncCollectorState) = wait(state.task_done)
 # Open a @sync block and initialise iterator state.
 function start(itr::AsyncCollector)
     sync_begin()
-    AsyncCollectorState(start(itr.enumerator),  0, Condition(), false)
+    AsyncCollectorState(start(itr.enumerator),  0, Condition(), false, false)
 end
 
 # Close @sync block when iterator is done.
 function done(itr::AsyncCollector, state::AsyncCollectorState)
+    if state.in_error
+        sync_end()
+
+        # state.in_error is only being set in the @async block (and an error thrown),
+        # which in turn should have been caught and thrown by the sync_end() call above.
+        # Control should not come here.
+        @assert false "Error should have been captured and thrown previously."
+    end
+
     if !state.done && done(itr.enumerator, state.enum_state)
         state.done = true
         sync_end()
@@ -62,24 +72,34 @@ function done(itr::AsyncCollector, state::AsyncCollectorState)
 end
 
 function next(itr::AsyncCollector, state::AsyncCollectorState)
-    # Wait if the maximum number of concurrent tasks are already running
+    # Wait if the maximum number of concurrent tasks are already running.
     while isbusy(itr, state)
         wait(state)
     end
 
-    # Get index and mapped function arguments from enumeration iterator
+    # Get index and mapped function arguments from enumeration iterator.
     (i, args), state.enum_state = next(itr.enumerator, state.enum_state)
 
-    # Execute function call and save result asynchronously
+    # Execute function call and save result asynchronously.
     @async begin
-        itr.results[i] = itr.f(args...)
-        state.active_count -= 1
+        try
+            itr.results[i] = itr.f(args...)
+        catch e
+            state.in_error = true
+            notify(state.task_done, e; error=true)
+
+            # The "notify" above raises an exception if "next" is waiting for tasks to finish.
+            # If the calling task is waiting on sync_end(), the rethrow() below will be captured
+            # by it.
+            rethrow(e)
+        finally
+            state.active_count -= 1
+        end
         notify(state.task_done, nothing)
     end
 
-    # Count number of concurrent tasks
+    # Count number of concurrent tasks.
     state.active_count += 1
-
     return (nothing, state)
 end
 
@@ -115,7 +135,7 @@ function done(itr::AsyncGenerator, state::AsyncGeneratorState)
     done(itr.collector, state.async_state) && isempty(itr.collector.results)
 end
 
-# Pump the source async collector if it is not already busy
+# Pump the source async collector if it is not already busy.
 function pump_source(itr::AsyncGenerator, state::AsyncGeneratorState)
     if !isbusy(itr.collector, state.async_state) &&
        !done(itr.collector, state.async_state)
@@ -132,7 +152,7 @@ function next(itr::AsyncGenerator, state::AsyncGeneratorState)
     results = itr.collector.results
     while !haskey(results, state.i)
 
-        # Wait for results to become available
+        # Wait for results to become available.
         if !pump_source(itr,state) && !haskey(results, state.i)
             wait(state.async_state)
         end
