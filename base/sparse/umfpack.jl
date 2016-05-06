@@ -415,13 +415,21 @@ end
 
 function getindex(lu::UmfpackLU, d::Symbol)
     L,U,p,q,Rs = umf_extract(lu)
-    d == :L ? L :
-    (d == :U ? U :
-     (d == :p ? p :
-      (d == :q ? q :
-       (d == :Rs ? Rs :
-        (d == :(:) ? (L,U,p,q,Rs) :
-         throw(KeyError(d)))))))
+    if d == :L
+        L
+    elseif d == :U
+        U
+    elseif d == :p
+        p
+    elseif d == :q
+        q
+    elseif d == :Rs
+        Rs
+    elseif d == :(:)
+        (L,U,p,q,Rs)
+    else
+         throw(KeyError(d))
+    end
 end
 
 for Tv in (:Float64, :Complex128), Ti in UmfpackIndexTypes
