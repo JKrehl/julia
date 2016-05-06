@@ -672,77 +672,119 @@ end
 
 # pmap tests. Needs at least 4 processors dedicated to the below tests. Which we currently have
 # since the parallel tests are now spawned as a separate set.
-s = repeat("abcdefghijklmnopqrstuvwxyz", 10);
-ups = uppercase(s);
-
 unmangle_exception = e -> begin
-    while (isa(e, CompositeException) || isa(e, RemoteException))
+    while any(x->isa(e, x), [CompositeException, RemoteException, CapturedException])
         if isa(e, CompositeException)
             e = e.exceptions[1].ex
         end
         if isa(e, RemoteException)
             e = e.captured.ex
         end
+        if isa(e, CapturedException)
+            e = e.ex
+        end
     end
     return e
 end
 
-errifeqa = x->(x=='a') ? error("foobar") : uppercase(x)
+# Test all combinations of pmap keyword args.
+pmap_args = [
+                (:distributed, [:default, false]),
+                (:batch_size, [:default,2]),
+                (:on_error, [:default, e -> unmangle_exception(e).msg == "foobar"]),
+                (:retry_on_error, [:default, e -> unmangle_exception(e).msg == "foobar"]),
+                (:retry_n, [:default, typemax(Int)-1]),
+                (:retry_max_delay, [0, 0.001])
+            ]
 
-errifeven = x->iseven(Int(x)) ? error("foobar") : uppercase(x)
-
-for (throws_err, mapf) in [ (true, map),
-                            (true, asyncmap),
-                            (true, pmap),
-                            (false, (f,c)->pmap(f, c; on_error = e->e)),
-                            (true, (f,c)->pmap(f, c; distributed=false)),
-                            (true, (f,c)->pmap(f, c; batch_size=3))
-                          ]
-    @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(x), s)])
-    @test ups == bytestring(UInt8[UInt8(c) for c in mapf(x->uppercase(Char(x)), s.data)])
-
-    if throws_err
-        # retry, on error exit
-        try
-            res = mapf(retry(errifeqa), s)
-            error("unexpected")
-        catch e
-            e = unmangle_exception(e)
-            @test isa(e, ErrorException)
-            @test e.msg == "foobar"
-        end
-
-        # no retry, on error exit
-        try
-            res = mapf(errifeqa, s)
-            error("unexpected")
-        catch e
-            e = unmangle_exception(e)
-            @test isa(e, ErrorException)
-            @test e.msg == "foobar"
-        end
-    else
-        res = mapf(errifeven, s)
-        @test length(res) == length(ups)
-        for i in 1:length(s)
-            if iseven(Int(s[i]))
-                @test isa(res[i], Exception)
-                e = unmangle_exception(res[i])
-                @test isa(e, ErrorException)
-                @test e.msg == "foobar"
-            else
-                @test res[i] == uppercase(s[i])
+kwdict = Dict()
+function walk_args(i)
+    if i > length(pmap_args)
+        kwargs = []
+        for (k,v) in kwdict
+            if v != :default
+                push!(kwargs, (k,v))
             end
         end
+
+        data = [x for x in 1:100]
+
+        testw = kwdict[:distributed] == false ? [1] : workers()
+
+        if (kwdict[:on_error] == :default) && (kwdict[:retry_n] == :default)
+            mapf = x -> (x*2, myid())
+            results_test = pmap_res -> begin
+                results = [x[1] for x in pmap_res]
+                pids = [x[2] for x in pmap_res]
+                @test results == [x for x in 2:2:200]
+                for p in testw
+                    @test p in pids
+                end
+            end
+        elseif kwdict[:retry_n] != :default
+            mapf = x -> iseven(myid()) ? error("foobar") : (x*2, myid())
+            results_test = pmap_res -> begin
+                results = [x[1] for x in pmap_res]
+                pids = [x[2] for x in pmap_res]
+                @test results == [x for x in 2:2:200]
+                for p in testw
+                    if isodd(p)
+                        @test p in pids
+                    else
+                        @test !(p in pids)
+                    end
+                end
+            end
+        else (kwdict[:on_error] != :default) && (kwdict[:retry_n] == :default)
+            mapf = x -> iseven(x) ? error("foobar") : (x*2, myid())
+            results_test = pmap_res -> begin
+                w = testw
+                for (idx,x) in enumerate(data)
+                    if iseven(x)
+                        @test pmap_res[idx] == true
+                    else
+                        @test pmap_res[idx][1] == x*2
+                        @test pmap_res[idx][2] in w
+                    end
+                end
+            end
+        end
+
+        try
+            results_test(pmap(mapf, data; kwargs...))
+        catch e
+            println("pmap executing with args : ", kwargs)
+            rethrow(e)
+        end
+
+        return
     end
+
+    kwdict[pmap_args[i][1]] = pmap_args[i][2][1]
+    walk_args(i+1)
+
+    kwdict[pmap_args[i][1]] = pmap_args[i][2][2]
+    walk_args(i+1)
 end
 
-# retry till success.
-errifevenid = x->iseven(myid()) ? error("foobar") : myid()
-mapf = (f, c) -> asyncmap(retry(remote(f), n=typemax(Int), max_delay=0), c)
-res = mapf(errifevenid, s)
-@test length(res) == length(ups)
-@test all(isodd, res)
+# Test for various kw arg combinations
+walk_args(1)
+
+# Simple test for pmap throws error
+error_thrown = false
+try
+    pmap(x -> x==50 ? error("foobar") : x, 1:100)
+catch e
+    @test unmangle_exception(e).msg == "foobar"
+    error_thrown = true
+end
+@test error_thrown
+
+# Test pmap with a generator type iterator
+pmap(x->x, Base.Generator(x->(sleep(0.0001); x), 1:100))
+
+# Test asyncmap
+@test allunique(asyncmap(x->object_id(current_task()), 1:100))
 
 
 # The below block of tests are usually run only on local development systems, since:

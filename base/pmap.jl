@@ -1,12 +1,12 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-type BatchProcessingError <: ErrorException
+type BatchProcessingError <: Exception
     data
     ex
 end
 
 """
-    pgenerate([::WorkerPool], f, c...) -> iterator
+    pgenerate([::WorkerPool], f, c...) -> (iterator, process_batch_errors)
 
 Apply `f` to each element of `c` in parallel using available workers and tasks.
 
@@ -19,9 +19,10 @@ Note that `f` must be made available to all worker processes; see
 and Loading Packages <man-parallel-computing-code-availability>`)
 for details.
 """
-function pgenerate(p::WorkerPool, f, c; distributed=true, batch_size=1, on_error=nothing, retry=nothing)
-    f_orig = f
-
+function pgenerate(p::WorkerPool, f, c; distributed=true, batch_size=1, on_error=nothing,
+                                        retry_on_error=DEFAULT_RETRY_ON_ERROR,
+                                        retry_n=0,
+                                        retry_max_delay=0)
     # Don't do remote calls if there are no workers.
     if (length(p) == 0) || (length(p) == 1 && fetch(p.channel) == myid())
         distributed = false
@@ -38,45 +39,27 @@ function pgenerate(p::WorkerPool, f, c; distributed=true, batch_size=1, on_error
             f = remote(p, f)
         end
 
-        f = wrap_retry(f, retry)
-        f = handle_on_error(f, on_error)
-        return AsyncGenerator(f, c)
+        if retry_n > 0
+            f = wrap_retry(f, retry_on_error, retry_n, retry_max_delay)
+        end
+        if on_error != nothing
+            f = wrap_on_error(f, on_error)
+        end
+        return (AsyncGenerator(f, c), nothing)
     else
         batches = batchsplit(c, min_batch_count = length(p) * 3,
                                 max_batch_size = batch_size)
 
-        # We need to ensure that if on_error is set, it is called for each element
-        # in error, and that we return as many elements as the original list.
+        # During batch processing, We need to ensure that if on_error is set, it is called
+        # for each element in error, and that we return as many elements as the original list.
         # retry, if set, has to be called element wise and we will do a best-effort
-        # to ensure that we do not call mapped function on the same element twice.
+        # to ensure that we do not call mapped function on the same element more than retry_n.
         # This guarantee is not possible in case of worker death / network errors, wherein
         # we will retry the entire batch on a new worker.
-        f = handle_on_error(f, (x,e)->BatchProcessingError(x,e); capture_data=true)
-
+        f = wrap_on_error(f, (x,e)->BatchProcessingError(x,e); capture_data=true)
         f = wrap_batch(f, p, on_error)
-
-        results = flatten(AsyncGenerator(f, batches))
-
-        # Handle all the ones in error in another pmap, with batch size set to 1
-        if (on_error != nothing) || (retry != nothing)
-            reprocess = []
-            for (idx, v) in enumerate(results)
-                if isa(v, BatchProcessingError)
-                    push!(reprocess, (i,v))
-                end
-            end
-
-            if length(reprocess) > 0
-                errors = [x->x[2] for x in reprocess]
-                data_in_error = [x.data for x in errors]
-                processed_errors = pmap(p, f_orig, data_in_error; on_error=on_error, retry=retry)
-                for (idx, v) in enumerate(processed_errors)
-                    results[reprocess[idx][1]] = v
-                end
-            end
-        end
-
-        return results
+        return (flatten(AsyncGenerator(f, batches)),
+                (p, f, results)->process_batch_errors!(p, f, results, on_error, retry_on_error, retry_n, retry_max_delay))
     end
 end
 
@@ -86,24 +69,20 @@ pgenerate(f, c; kwargs...) = pgenerate(default_worker_pool(), f, c...; kwargs...
 pgenerate(f, c1, c...; kwargs...) = pgenerate(a->f(a...), zip(c1, c...); kwargs...)
 
 function wrap_on_error(f, on_error; capture_data=false)
-    if on_error != nothing
-        return x -> begin
-            try
-                f(x)
-            catch e
-                if capture_data
-                    on_error(x, e)
-                else
-                    on_error(e)
-                end
+    return x -> begin
+        try
+            f(x)
+        catch e
+            if capture_data
+                on_error(x, e)
+            else
+                on_error(e)
             end
         end
-    else
-        return f
     end
 end
 
-wrap_retry(f, retryf) = (retryf != nothing ? retryf(f) : f)
+wrap_retry(f, on_error, n, max_delay) = retry(f, on_error; n=n, max_delay=max_delay)
 
 function wrap_batch(f, p, on_error)
     f = asyncmap_batch(f)
@@ -153,7 +132,50 @@ you can specify an error handling function via argument `on_error` which takes i
 the exception. The function can stop the processing by rethrowing the error, or, to continue, return any value
 which is then returned inline with the results to the caller.
 """
-pmap(p::WorkerPool, f, c...; kwargs...) = collect(pgenerate(p, f, c...; kwargs...))
+function pmap(p::WorkerPool, f, c...; kwargs...)
+    results_iter, process_errors! = pgenerate(p, f, c...; kwargs...)
+    results = collect(results_iter)
+    if isa(process_errors!, Function)
+        process_errors!(p, f, results)
+    end
+    results
+end
+
+function process_batch_errors!(p, f, results, on_error, retry_on_error, retry_n, retry_max_delay)
+    # Handle all the ones in error in another pmap, with batch size set to 1
+    do_error_processing = on_error != nothing
+
+    if do_error_processing || (retry_n > 0)
+        reprocess = []
+        for (idx, v) in enumerate(results)
+            if isa(v, BatchProcessingError)
+                push!(reprocess, (idx,v))
+            end
+        end
+
+        if length(reprocess) > 0
+            errors = [x[2] for x in reprocess]
+            exceptions = [x.ex for x in errors]
+            if (retry_n > 0) && all([retry_on_error(ex) for ex in exceptions])
+                retry_n = retry_n - 1
+                error_processed = pmap(p, f, [x.data for x in errors];
+                                                    on_error=on_error,
+                                                    retry_on_error=retry_on_error,
+                                                    retry_n=retry_n,
+                                                    retry_max_delay=retry_max_delay)
+            elseif do_error_processing
+                error_processed = map(on_error, exceptions)
+            else
+                throw(CompositeException(exceptions))
+            end
+
+            for (idx, v) in enumerate(error_processed)
+                results[reprocess[idx][1]] = v
+            end
+        end
+    end
+    nothing
+end
 
 
 """

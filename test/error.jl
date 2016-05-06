@@ -16,47 +16,42 @@ let
 
     # Success on second attempt
     c = [0]
-    @test retry(foo_error)(c,1) == 7
+    @test retry(foo_error;n=1)(c,1) == 7
     @test c[1] == 2
 
-    # Success on third attempt
+    # 2 failed retry attempts, so exception is raised
     c = [0]
-    @test retry(foo_error)(c,2) == 7
-    @test c[1] == 3
-
-    # 3 failed attempts, so exception is raised
-    c = [0]
-    ex = try retry(foo_error)(c,3); catch e; e; end
+    ex = try retry(foo_error;n=2)(c,3) catch e; e end
     @test ex.msg == "foo"
     @test c[1] == 3
 
     c = [0]
-    ex = try (retry(foo_error, ErrorException))(c,3); catch e; e; end
+    ex = try retry(foo_error, ErrorException)(c,2) catch e; e end
     @test typeof(ex) == ErrorException
     @test ex.msg == "foo"
-    @test c[1] == 3
+    @test c[1] == 2
 
     c = [0]
-    ex = try (retry(foo_error, e->e.msg == "foo"))(c,3) catch e; e; end
+    ex = try retry(foo_error, e->e.msg == "foo")(c,2) catch e; e end
     @test typeof(ex) == ErrorException
     @test ex.msg == "foo"
-    @test c[1] == 3
+    @test c[1] == 2
 
     # No retry if condition does not match
     c = [0]
-    ex = try (retry(foo_error, e->e.msg == "bar"))(c,3) catch e; e; end
+    ex = try retry(foo_error, e->e.msg == "bar"; n=3)(c,2) catch e; e end
     @test typeof(ex) == ErrorException
     @test ex.msg == "foo"
     @test c[1] == 1
 
     c = [0]
-    ex = try (retry(foo_error, e->e.http_status_code == "503"))(c,3) catch e; e; end
+    ex = try retry(foo_error, e->e.http_status_code == "503")(c,2) catch e; e end
     @test typeof(ex) == ErrorException
     @test ex.msg == "foo"
     @test c[1] == 1
 
     c = [0]
-    ex = try (retry(foo_error, SystemError))(c,3) catch e; e; end
+    ex = try retry(foo_error, SystemError)(c,2) catch e; e end
     @test typeof(ex) == ErrorException
     @test ex.msg == "foo"
     @test c[1] == 1

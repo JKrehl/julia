@@ -52,11 +52,11 @@ end
 
 
 """
-    retry(f, [condition]; n=3; max_delay=10) -> Function
+    retry(f, [on_error]; n=3; max_delay=10) -> Function
 
 Returns a lambda that retries function `f` up to `n` times in the
-event of an exception. If `condition` is a `Type` then retry only
-for exceptions of that type. If `condition` is a function
+event of an exception. If `on_error` is a `Type` then retry only
+for exceptions of that type. If `on_error` is a function
 `cond(::Exception) -> Bool` then retry only if it is true.
 
 **Examples**
@@ -65,15 +65,17 @@ retry(http_get, e -> e.status == "503")(url)
 retry(read, UVError)(io)
 ```
 """
-function retry(f::Function, condition::Function=e->true;
-               n::Int=3, max_delay::Int=10)
+DEFAULT_RETRY_N = 1
+DEFAULT_RETRY_ON_ERROR = e->true
+DEFAULT_RETRY_MAX_DELAY = 0
+function retry(f::Function, on_error::Function=DEFAULT_RETRY_ON_ERROR; n=DEFAULT_RETRY_N, max_delay=DEFAULT_RETRY_MAX_DELAY)
     (args...) -> begin
         delay = 0.05
-        for i = 1:n
+        for i = 1:n+1
             try
                 return f(args...)
             catch e
-                if i == n || try condition(e) end != true
+                if i > n || try on_error(e) end != true
                     rethrow(e)
                 end
             end
